@@ -1,0 +1,235 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Destination;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float3 _LightDirection;
+
+int type;
+float power;
+float epsilon = 0.001f;
+float darkness;
+float blackAndWhite;
+float3 colorAMix;
+float3 colorBMix;
+
+static  const float maxDist = 200.f;
+static  const int maxStepCount = 500;
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    float3 origin = mul(_CameraToWorld, float4(0,0,0,1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0,1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0)).xyz;
+    direction = normalize(direction);
+    return  CreateRay(origin, direction);
+}
+
+float2 TetrahedronDE(float3 position, int iterations)
+{
+    //position.xyz = fmod((position.xyz),10.0); // instance on xy-plane
+
+    float3 vert1 = float3(1,1,1);
+    float3 vert2 = float3(-1,-1,1);
+    float3 vert3 = float3(1,-1,-1);
+    float3 vert4 = float3(-1,1,-1);
+    float3 center;
+
+    float scale = 2;
+    int n = 0;
+    float dist, d;
+
+    while (n < iterations)
+    {
+        center = vert1;
+        dist = length(position - vert1);
+        
+        d = length(position - vert2);
+        
+        if(d < dist)
+        {
+            center = vert2;
+            dist = d;
+        }
+        
+        d = length(position - vert3);
+        
+        if(d < dist)
+        {
+            center = vert3;
+            dist = d;
+        }
+        
+        d = length(position - vert4);
+        
+        if(d < dist)
+        {
+            center = vert4;
+            dist = d;
+        }
+
+        position = scale*position-center*(scale-1);
+        n++;
+    }
+
+    return length(position) * pow(scale, float(-n));
+}
+
+float2 TetrahedronFoldDE(float3 position)
+{
+
+    float r;
+    float scale = 2;
+    float offset = 2;
+    int iterations = 10;
+    int n = 0;
+    while(n < iterations)
+    {
+        if(position.x + position.y < 0)position.xy = -position.yx;
+        if(position.x + position.z < 0)position.xz = -position.zx;
+        if(position.y + position.z < 0)position.zy = -position.yz;
+        position = position * scale - offset * (scale-1);
+        n++;
+    }
+    return length(position) * pow(scale, float(-n));
+}
+
+float2 MandelBulbDE(float3 position)
+{
+    float3 z = position;
+    float dr = 1.0;
+    float r = 0.0;
+    int iterations = 0;
+
+    for (int i = 0; i < 35; i++)
+    {
+        iterations = i;
+
+        r = length(z);
+
+        if(r>2)
+        {
+            break;
+        }
+
+        float theta = acos(z.z/r);
+        float phi = atan2(z.y, z.x);
+        dr = pow(r, power-1.0) * power * dr + 1.0;
+
+        float zr = pow(r, power);
+        theta = theta * power;
+        phi = phi * power;
+
+        z = zr * float3(sin(theta) * cos(phi), sin(phi) * sin(theta), cos(theta));
+        z+=position;
+    }
+    
+    float dst = 0.5 * log(r) * r / dr;
+    
+    return float2(iterations, dst*1);
+
+}
+
+float2 SphereDE(float3 position)
+{
+    position.xyz = fmod((position.xyz),3.0) - 1.5;
+    return max(0.0, length(position)-1);
+
+}
+
+float2 SceneInformation(float3 position)
+{
+    //return abs(length(position)-1);
+    if(type == 0) return MandelBulbDE(position);
+    if(type == 1) return TetrahedronDE(position, 50);
+    if(type == 2) return SphereDE(position);
+    if(type == 3)
+    {
+        position.xyz = fmod((position.xyz),5.0) - 2.5;
+        return TetrahedronDE(position, 50);
+    }
+    
+    
+    
+    return 0;
+}
+
+float GetEpsilon(float dst)
+{
+    return max(epsilon * dst, 0.000001f);
+}
+
+float3 EstimateNormal(float3 p, float dst)
+{
+    float x = SceneInformation(float3(p.x + GetEpsilon(dst), p.y, p.z)).y -
+        SceneInformation(float3(p.x - GetEpsilon(dst), p.y, p.z)).y;
+    
+    float y = SceneInformation(float3(p.x, p.y + GetEpsilon(dst), p.z)).y -
+        SceneInformation(float3(p.x, p.y - GetEpsilon(dst), p.z)).y;
+    
+    float z = SceneInformation(float3(p.x, p.y, p.z + GetEpsilon(dst))).y -
+        SceneInformation(float3(p.x, p.y, p.z - GetEpsilon(dst))).y;
+
+    return normalize(float3(x,y,z));
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Destination.GetDimensions(width, height);
+
+    float2 uv = id.xy / float2(width, height);
+
+    //Background Gradient Color
+    float4 result = lerp(float4(255, 255, 255, 255), float4(70, 70, 200, 255), uv.y)/255.0;
+
+    Ray ray = CreateCameraRay(uv * 2 - 1);
+    float rayDst = 0;
+    int marchSteps = 0;
+
+    while (rayDst < maxDist && marchSteps < maxStepCount)
+    {
+        marchSteps++;
+        
+        float2 sceneInfo = SceneInformation(ray.origin);
+        float dst = sceneInfo.y;
+
+        if(dst <= GetEpsilon(rayDst)) 
+        {
+            float escapeIteration = sceneInfo.y;
+            float3 normal = EstimateNormal(ray.origin - ray.direction * GetEpsilon(dst) * 2, rayDst);
+
+            float colorA = saturate(dot(normal * 1.5f + .5f, -_LightDirection));
+            float colorB = saturate(escapeIteration * 16);
+            float3 colorMix = saturate(colorA * colorAMix + colorB * colorBMix);
+
+            result = float4(colorMix.xyz, 1);
+            break;
+        }
+
+        ray.origin += ray.direction * dst;
+        rayDst += dst;
+    }
+
+    float rim = marchSteps / darkness;
+    Destination[id.xy] = lerp(result, 1, blackAndWhite) * rim;
+}
